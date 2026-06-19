@@ -11,4 +11,8 @@ Contents
 - analytic       : closed-form laminate effective stiffness (validates the DNS oracle)
 - dns_elasticity_3d : the DNS micro-solver (3D voxel periodic homogenization)
 - cells          : deterministic microstructure generators (layers, char wedge)
+- regulator      : minimal regulated cardiovascular loop + bounded reserve; the
+                   phase-space / basin-of-attraction oracle for V1.5 (mortality)
+- regulator_stability : inertial-actuator regulator + linear-stability / limit-cycle
+                   oracle for V1.6 (passivity vs a naïve force controller)
 """

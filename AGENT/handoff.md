@@ -156,8 +156,7 @@ class, and a suggested build path consistent with the conventions above.
 ---
 
 ## 6. Known issues / loose ends
-- **`AGENT/v1_4plan.md` shows as deleted** in `git status` (not by me; carried across sessions) —
-  restore or remove deliberately.
+
 - `__pycache__/*.pyc` are tracked in the repo and show as modified on each run — pre-existing
   hygiene quirk, harmless; consider gitignoring `__pycache__/` and `_calib_v*.py` scratch files.
 - Scratch calibration files `oracles/_calib_v1{5,6}.py` are intentionally uncommitted helpers.

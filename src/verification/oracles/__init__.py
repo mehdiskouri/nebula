@@ -15,4 +15,17 @@ Contents
                    phase-space / basin-of-attraction oracle for V1.5 (mortality)
 - regulator_stability : inertial-actuator regulator + linear-stability / limit-cycle
                    oracle for V1.6 (passivity vs a naïve force controller)
+- topology_opt   : 3D linear-elastic boundary-value FE solver + load-case domains
+                   (cantilever / creature) + the SIMP topology-optimization oracle for
+                   V1.7 (skeleton precipitation). Reuses element_stiffness (dns_elasticity_3d)
+                   + isotropic_stiffness (homogenization); cupy-CG / CPU-LU backend.
+- wolff          : Wolff's-law (Huiskes/Mullender) strain-energy remodeling — the cheap
+                   deposition mechanism under test for V1.7, judged against topology_opt's SIMP
+- growth         : dimension-agnostic field-biased L-system growth front + memoizable growth
+                   trace + write-back/heal — the mechanism under test for V1.8 (growth
+                   memoization & write-back correctness; reuses determinism.bitwise_equal)
+- dualcloud      : coarse physics cloud + rotation-aware linear-blend skinning of a dense
+                   render cloud (+ translation-only foil) vs an exact deformation-field oracle —
+                   the mechanism under test for V1.9 (dual-cloud skinning fidelity; numpy +
+                   Warp GPU skinning at full scale; reuses determinism.rel_diff)
 """

@@ -4,9 +4,10 @@
 notebooks). It records what is done, the headline results, how the work is structured, and exactly
 what remains — **V1.7, V1.8, V1.9** — so the next session can pick up cold.
 
-**One-line status.** Tier 0 ✅ (V0.1–V0.5). **Tier 1 phase-gates ✅ (V1.1–V1.6).** Remaining:
-**V1.7–V1.9**, which gate their *own* subsystems and are **not** exit-criteria for any phase
-already unblocked.
+**One-line status.** Tier 0 ✅ (V0.1–V0.5). **Tier 1 ✅ (V1.1–V1.9).** **Tier 2 in progress:**
+**V2.4 ✅ PASS**, **V2.1 ⚠️ CONSTRAIN** (a working violent-regime handoff exists, but surrogate
+self-uncertainty is only borderline calibrated → gate with the descriptor validity-envelope; see
+`verification_notebooks/phase2/results/tier2_report.md`). Remaining Tier 2: V2.2, V2.3, V2.5.
 
 > Read order for a newcomer: `AGENT/ARCHITECTURE.md` → `AGENT/verification_protocol.md` →
 > `verification_notebooks/phase0/results/tier0_report.md` →
@@ -27,7 +28,10 @@ different way, and **pass criteria frozen before the notebook runs**. A red resu
 - **Phase-0 tree slice** — needs Tier 0 + V1.1–V1.3. ✅ **unblocked.**
 - **Authoring / spectral (arch. Phase 1)** — needs V1.4 (on the proven symmetry core). ✅ **unblocked.**
 - **Living things (arch. Phase 2)** — needs V1.5 + V1.6. ✅ **unblocked.**
-- Tier 2 scale/exotic work is gated on V2.1/V2.4 (not started; out of scope for this handoff).
+- Tier 2 scale/exotic work is gated on V2.1/V2.4. **V2.4 ✅ and V2.1 ⚠️ CONSTRAIN are now done**
+  (`verification_notebooks/phase2/`); the violent-regime cost ceiling is bounded by the always-RVE
+  fallback until uncertainty recalibration is built. Remaining Tier 2: V2.2 (percolation — the
+  connectivity trigger from V2.4 carries in), V2.3 (geo/physical), V2.5 (inverse design).
 
 ---
 

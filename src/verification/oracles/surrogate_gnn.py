@@ -132,7 +132,7 @@ class GraphPIGN(nn.Module):
         self.head_logvar = nn.Sequential(nn.Linear(2 * H, H), nn.SiLU(), nn.Linear(H, 1))
         self.double()
 
-    def forward(self, X_nodes, edge_index, X_desc_norm):
+    def forward(self, X_nodes, edge_index, X_desc_norm, return_feat=False):
         B, N, _ = X_nodes.shape
         g = self.desc_enc(X_desc_norm)                      # (B,H)
         h = self.node_enc(X_nodes)                          # (B,N,H)
@@ -145,8 +145,43 @@ class GraphPIGN(nn.Module):
             agg = torch.zeros_like(h).index_add_(1, dst, m) / deg[None, :, None]
             h = h + upd(torch.cat([h, agg], dim=-1))
         pooled = h.mean(dim=1)                              # (B,H)
-        z = torch.cat([pooled, g], dim=-1)                 # (B,2H)
-        return self.head_mu(z).squeeze(-1), self.head_logvar(z).squeeze(-1)
+        z = torch.cat([pooled, g], dim=-1)                 # (B,2H) penultimate representation
+        mu = self.head_mu(z).squeeze(-1)
+        logvar = self.head_logvar(z).squeeze(-1)
+        return (mu, logvar, z) if return_feat else (mu, logvar)
+
+
+class MemberNet(nn.Module):
+    """One ensemble member as a RANDOMIZED PRIOR FUNCTION (Osband et al. 2018) — the V2.1 fix.
+
+    Predictive mean = trainable.mu + beta * prior.mu, where `prior` is a SECOND GraphPIGN frozen
+    at its random init (params `requires_grad_(False)`). On the training data the trainable net
+    learns to fit `target - beta*prior`, so members agree; OFF the data the trainable part has no
+    signal to cancel its own random prior, so the members' priors DIVERGE -> var(member means)
+    grows with distance from the training manifold. This restores the distance-aware epistemic
+    signal the bare deep ensemble lacks (the diagnosed root cause of V2.1's `u` saturation),
+    WITHOUT removing the physics monotonicity prior (which still applies to the composite mean,
+    preserving the V2.4 data-efficiency win). logvar (aleatoric) comes from the trainable head.
+
+    Only the prior's *parameters* are frozen; its forward stays differentiable w.r.t. the input
+    so the physics penalty constrains the composite mean's descriptor-monotonicity.
+    """
+
+    def __init__(self, desc_dim=20, H=32, n_layers=3, beta=1.0):
+        super().__init__()
+        self.trainable = GraphPIGN(desc_dim=desc_dim, H=H, n_layers=n_layers)
+        self.prior = GraphPIGN(desc_dim=desc_dim, H=H, n_layers=n_layers)
+        for p in self.prior.parameters():
+            p.requires_grad_(False)
+        self.beta = float(beta)
+        self.double()
+
+    def forward(self, X_nodes, edge_index, X_desc_norm, return_feat=False):
+        mu, logvar, z = self.trainable(X_nodes, edge_index, X_desc_norm, return_feat=True)
+        if self.beta != 0.0:                    # skip the prior's forward/backward when unused
+            mu_p, _, _ = self.prior(X_nodes, edge_index, X_desc_norm, return_feat=True)
+            mu = mu + self.beta * mu_p
+        return (mu, logvar, z) if return_feat else (mu, logvar)
 
 
 # ------------------------------------------------------------------- training
@@ -159,6 +194,8 @@ class TrainCfg:
     physics: bool = True
     w_range: float = 1.0          # weight on the (0,1] range penalty
     w_mono: float = 3.0           # weight on the monotone-strength penalties
+    beta: float = 0.0             # randomized-prior scale; 0 = bare deep ensemble (V2.4 default),
+                                  # 1 = RPF (V2.1 opts in to fix off-manifold uncertainty)
 
 
 def _physics_penalty(model, X_nodes, edge_index, X_desc_norm, cfg):
@@ -175,15 +212,21 @@ def _physics_penalty(model, X_nodes, edge_index, X_desc_norm, cfg):
 
 
 def train_member(samples, y, cfg: TrainCfg, seed, normalizer=None):
-    """Train one heteroscedastic GraphPIGN member; returns (model, normalizer)."""
+    """Train one heteroscedastic RPF member (MemberNet); returns (model, normalizer).
+
+    The member's frozen random prior is initialized from `seed` (set_determinism) along with the
+    trainable net, so distinct member seeds give distinct priors -> the diversity V2.1 needs.
+    Only the trainable parameters are optimized; the prior is fixed.
+    """
     set_determinism(seed)
     X_nodes, E, X_desc = featurize(samples)
     if normalizer is None:
         normalizer = Normalizer.fit(X_desc)
     Xd = normalizer(X_desc)
     yt = torch.tensor(np.asarray(y), dtype=torch.float64, device=DEVICE)
-    model = GraphPIGN(desc_dim=X_desc.shape[1], H=cfg.H, n_layers=cfg.n_layers).to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    model = MemberNet(desc_dim=X_desc.shape[1], H=cfg.H, n_layers=cfg.n_layers,
+                      beta=cfg.beta).to(DEVICE)
+    opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=cfg.lr)
     for _ in range(cfg.epochs):
         opt.zero_grad()
         mu, logvar = model(X_nodes, E, Xd)
@@ -198,19 +241,22 @@ def train_member(samples, y, cfg: TrainCfg, seed, normalizer=None):
 class Ensemble:
     """Deep ensemble of heteroscedastic members -> mean + epistemic/aleatoric uncertainty."""
 
-    def __init__(self, members, normalizer):
+    def __init__(self, members, normalizer, featdensity=None):
         self.members = members
         self.normalizer = normalizer
+        self.featdensity = featdensity      # distance-to-manifold scorer (V2.1, A); may be None
 
     @staticmethod
     def train(samples, y, cfg: TrainCfg, M=5, base_seed=0, bootstrap=True):
-        """Train M members. Bootstrap resampling per member sharpens epistemic uncertainty in
-        sparse / off-manifold regions (members disagree where data is thin) — the signal both
-        V2.4's OOD test and V2.1's calibration depend on. The normalizer is fit once on the full
-        training descriptors so all members share a feature scaling."""
+        """Train M RPF members. Bootstrap resampling plus each member's frozen random prior
+        (MemberNet) sharpen epistemic uncertainty in sparse / off-manifold regions (members
+        disagree where data is thin) — the signal both V2.4's OOD test and V2.1's calibration
+        depend on. The normalizer and the FeatureDensity distance scorer are both fit once on the
+        full training descriptors so all members share one feature scaling and one manifold."""
         y = np.asarray(y, float)
         _, _, X_desc_full = featurize(samples)
         normalizer = Normalizer.fit(X_desc_full)
+        featdensity = FeatureDensity.fit(samples)
         members = []
         for m in range(M):
             if bootstrap:
@@ -222,11 +268,16 @@ class Ensemble:
             model, _ = train_member(s_m, y_m, cfg, seed=base_seed + 100 * m,
                                     normalizer=normalizer)
             members.append(model)
-        return Ensemble(members, normalizer)
+        return Ensemble(members, normalizer, featdensity)
 
     @torch.no_grad()
     def predict(self, samples):
-        """Returns dict: mean, u (total std), epistemic, aleatoric (all numpy, len B)."""
+        """Returns dict: mean, u (bare neural std), epistemic, aleatoric, dist (all numpy, len B).
+
+        `u` is the bare neural uncertainty (ensemble + heteroscedastic); `dist` is the distance-to-
+        manifold term. V2.1's calibrated trust scalar is assembled from (epistemic, aleatoric, dist)
+        by `handoff_rule.Calibrator` — keeping this method a pure forward pass.
+        """
         X_nodes, E, X_desc = featurize(samples)
         Xd = self.normalizer(X_desc)
         mus, vars = [], []
@@ -239,8 +290,11 @@ class Ensemble:
         epistemic = mus.var(0, unbiased=False)
         aleatoric = vars.mean(0)
         u = torch.sqrt(epistemic + aleatoric)
-        return {k: v.cpu().numpy() for k, v in dict(
+        out = {k: v.cpu().numpy() for k, v in dict(
             mean=mean, u=u, epistemic=torch.sqrt(epistemic), aleatoric=torch.sqrt(aleatoric)).items()}
+        out["dist"] = (self.featdensity.score(samples) if self.featdensity is not None
+                       else np.zeros(len(samples)))
+        return out
 
     def state(self):
         return [m.state_dict() for m in self.members]
@@ -260,22 +314,56 @@ class EnvelopeDetector:
     trigger; the ensemble `u` is the corroborating prediction-side signal.
     """
 
-    def __init__(self, mu, sd):
+    def __init__(self, mu, sd, connectivity=False):
         self.mu = mu
         self.sd = sd
+        self.connectivity = connectivity     # whether the descriptor carries the V2.2 connectivity channels
 
     @staticmethod
-    def fit(train_samples, floor=1e-6):
+    def fit(train_samples, floor=1e-6, connectivity=False):
         # Per-channel z-score (robust to the descriptor's collinear isotropic channels, where a
         # full-covariance Mahalanobis goes singular). Score = max standardized deviation.
-        D = np.stack([vc.descriptor(s.grid, s.materials) for s in train_samples])
+        # `connectivity=True` (V2.2) fits over the 23-vec descriptor whose appended conductance-
+        # residual channels make the envelope CONNECTIVITY-AWARE — so a percolating seam exits the
+        # envelope on its own, no parallel boolean gate needed. Default False is byte-identical (V2.4/V2.1).
+        D = np.stack([vc.descriptor(s.grid, s.materials, connectivity=connectivity) for s in train_samples])
         sd = D.std(0)
         sd = np.where(sd < floor, np.inf, sd)        # constant channels carry no OOD signal
-        return EnvelopeDetector(D.mean(0), sd)
+        return EnvelopeDetector(D.mean(0), sd, connectivity=connectivity)
+
+    def score(self, samples):
+        D = np.stack([vc.descriptor(s.grid, s.materials, connectivity=self.connectivity) for s in samples])
+        return np.abs((D - self.mu) / self.sd).max(axis=1)
+
+
+class FeatureDensity:
+    """Continuous distance-to-training-manifold in DESCRIPTOR space (the restriction-operator
+    coordinate) — the (A) term that makes `u` distance-aware so it cannot saturate on the violent
+    extrapolation tail (the diagnosed V2.1 failure). A shrinkage-regularized Mahalanobis distance,
+    the continuous generalization of EnvelopeDetector's discrete max-z: standardize, drop constant
+    channels (the descriptor's collinear/isotropic ones make a raw covariance singular), and whiten
+    by a correlation matrix shrunk toward identity. Returns a chi-normalized distance (~1 for a
+    typical in-family cell, growing without bound off-manifold).
+    """
+
+    def __init__(self, mu, sd, keep, Cinv):
+        self.mu, self.sd, self.keep, self.Cinv = mu, sd, keep, Cinv
+
+    @staticmethod
+    def fit(train_samples, shrink=0.15, floor=1e-9):
+        D = np.stack([vc.descriptor(s.grid, s.materials) for s in train_samples])
+        mu, sd = D.mean(0), D.std(0)
+        keep = sd > floor
+        Z = (D[:, keep] - mu[keep]) / sd[keep]
+        C = np.atleast_2d(np.corrcoef(Z, rowvar=False))
+        C = (1.0 - shrink) * C + shrink * np.eye(C.shape[0])      # shrink toward identity -> PD
+        return FeatureDensity(mu, sd, keep, np.linalg.inv(C))
 
     def score(self, samples):
         D = np.stack([vc.descriptor(s.grid, s.materials) for s in samples])
-        return np.abs((D - self.mu) / self.sd).max(axis=1)
+        Z = (D[:, self.keep] - self.mu[self.keep]) / self.sd[self.keep]
+        m2 = np.einsum("ni,ij,nj->n", Z, self.Cinv, Z)
+        return np.sqrt(np.maximum(m2, 0.0) / int(self.keep.sum()))
 
 
 def fallback_flags(samples, env, z_thresh):
@@ -313,7 +401,7 @@ if __name__ == "__main__":
         return float(np.clip(0.9 - 0.5 * depth - 0.12 * np.log10(contrast), 0.02, 1.0))
 
     y_tr = [synth(s) for s in train]
-    cfg = TrainCfg(epochs=250, physics=True)
+    cfg = TrainCfg(epochs=250, physics=True, beta=1.0)      # exercise the RPF path (V2.1 fix)
     ens = Ensemble.train(train, y_tr, cfg, M=5, base_seed=0)
 
     pred_tr = ens.predict(train)
@@ -339,9 +427,18 @@ if __name__ == "__main__":
     assert flags_ood.mean() >= 0.99, "combined trigger must flag essentially all OOD cells"
     assert flags_te.mean() <= 0.10, "in-family false-positive rate must stay low"
 
+    # 2c) RPF distance-awareness: the FeatureDensity score must rise on OOD vs in-family (the
+    #     monotone distance term that stops `u` saturating on the violent tail — the V2.1 fix).
+    d_te = ens.featdensity.score(test)
+    d_ood = ens.featdensity.score(ood)
+    print(f"2c) feature-density distance: in-family median={np.median(d_te):.2f}, "
+          f"OOD median={np.median(d_ood):.2f}")
+    assert np.median(d_ood) > np.median(d_te), "distance term must rise OOD"
+
     # 3) save/load reproducibility
     states = ens.state()
-    ens2 = Ensemble([GraphPIGN().to(DEVICE) for _ in range(5)], ens.normalizer).load(states)
+    ens2 = Ensemble([MemberNet(beta=cfg.beta).to(DEVICE) for _ in range(5)],
+                    ens.normalizer, ens.featdensity).load(states)
     p2 = ens2.predict(test)
     assert np.allclose(p2["mean"], pred_te["mean"], atol=1e-10), "reload must reproduce"
     print("3) save/load reproduces predictions: OK")

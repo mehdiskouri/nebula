@@ -17,6 +17,7 @@ Pure numpy/scipy; the surrogate, its uncertainty, and the RVE ground truth come 
 surrogate_gnn / dns_damage_3d. This module is just the decision calculus over those numbers.
 """
 from dataclasses import dataclass
+from math import erf, sqrt
 
 import numpy as np
 from scipy.stats import spearmanr
@@ -67,6 +68,59 @@ def overconfidence(abs_err, u, k=1.0):
     """Nominal-minus-observed coverage at k*sigma; > 0 == systematically over-confident."""
     obs, nom = coverage(abs_err, u, ks=(k,))[k]
     return float(nom - obs)
+
+
+# ------------------------------------------------------------------- calibrated trust scalar (B)
+@dataclass
+class Calibrator:
+    """Rank-preserving recalibration of the trust scalar on a HELD-OUT split (V2.1, B).
+
+        u_cal = s * u ,   s = quantile_{nominal}(|err| / u) / k   (coverage-match at k-sigma)
+
+    The randomized-prior ensemble (`surrogate_gnn`, fix C) already makes the bare `u` *rank*-
+    reliable (the binned-rho gate); what remains is its magnitude. Temperature scaling is monotone,
+    so it corrects coverage WITHOUT disturbing that rank-reliability. Empirically the violent tail
+    is heavy and sparse (a few catastrophic cells among many easy extrapolation cells), so a single
+    global scale cannot fully cover it — which is precisely why the distance-keyed
+    `mondrian_conformal` supplies the distribution-free coverage GUARANTEE alongside this. (The
+    earlier idea of folding the FeatureDensity distance into the scalar as an additive variance was
+    tried and rejected: on real violent cells the distance is a modest, noisy *point* predictor, so
+    it belongs in the conformal grouping, not the scalar.)
+    """
+    s: float
+
+    @staticmethod
+    def fit(pred, abs_err, k=2.0):
+        u = np.maximum(np.asarray(pred["u"], float), 1e-12)
+        ratio = np.asarray(abs_err, float) / u
+        nominal = erf(k / sqrt(2.0))
+        return Calibrator(s=float(max(np.quantile(ratio, nominal) / k, 1e-9)))
+
+    def u(self, pred):
+        """Temperature-scaled trust scalar for a prediction dict (uses the bare RPF `u`)."""
+        return self.s * np.asarray(pred["u"], float)
+
+
+def mondrian_conformal(dist_cal, abs_err_cal, dist_test, alpha=0.1, n_bins=3):
+    """Distance-binned (Mondrian) split-conformal half-widths — the coverage GUARANTEE under shift.
+
+    Plain split-conformal assumes exchangeability, which the deliberate violent-tail extrapolation
+    violates. Binning the calibration set by `dist` and giving each test cell the finite-sample
+    (1-alpha) |error| quantile of ITS distance bin restores group-conditional coverage: the tail
+    bin gets its own wider quantile. Returns per-test half-widths; |true error| <= half-width
+    should hold for ~ (1-alpha) of each bin.
+    """
+    dist_cal = np.asarray(dist_cal, float); abs_err_cal = np.asarray(abs_err_cal, float)
+    edges = np.quantile(dist_cal, np.linspace(0, 1, n_bins + 1))
+    edges[0], edges[-1] = -np.inf, np.inf
+    q = np.zeros(n_bins)
+    for b in range(n_bins):
+        m = (dist_cal > edges[b]) & (dist_cal <= edges[b + 1])
+        ae = abs_err_cal[m] if m.any() else abs_err_cal
+        lvl = min(1.0, np.ceil((len(ae) + 1) * (1 - alpha)) / max(len(ae), 1))   # conformal level
+        q[b] = float(np.quantile(ae, lvl))
+    idx = np.clip(np.digitize(np.asarray(dist_test, float), edges[1:-1]), 0, n_bins - 1)
+    return q[idx]
 
 
 # ------------------------------------------------------------------- decision rule
@@ -164,4 +218,26 @@ if __name__ == "__main__":
     rho2 = binned_rank_correlation(u2, rel_err)
     print(f"3) uncalibrated control: binned rho = {rho2:.3f} (must be << 0.8)")
     assert abs(rho2) < 0.6, "independent u must not track error — confirms the test has teeth"
+
+    # 4) THE V2.1 RECALIBRATION TOOLS on a saturated-`u`, heavy-tail population (error grows with a
+    #    distance signal while the bare `u` does not): (a) rank-preserving temperature corrects
+    #    coverage; (b) distance-keyed Mondrian conformal gives the coverage guarantee under shift.
+    M = 400
+    tail = rng.random(M) < 0.2
+    dist = np.where(tail, rng.uniform(2.0, 4.0, M), rng.uniform(0.2, 0.8, M))   # FeatureDensity-like
+    u_sat = 0.05 + rng.uniform(0.0, 0.01, M)                                    # bare u ~ saturated
+    err = np.abs(rng.normal(0.0, 0.03 + 0.10 * dist))                          # error grows w/ dist
+    cal, te = slice(0, M // 2), slice(M // 2, M)                                # held-out split
+    # (a) temperature: coverage-match at 2 sigma on the held-out split (monotone -> rank unchanged)
+    calib = Calibrator.fit(dict(u=u_sat[cal]), err[cal], k=2.0)
+    (cb, nom) = coverage(err[te], u_sat[te])[2.0]
+    (ct, _) = coverage(err[te], calib.u(dict(u=u_sat[te])))[2.0]
+    print(f"4a) saturated bare u 2sigma cov={cb:.2f} -> temperature(s={calib.s:.2f}) {ct:.2f} (nominal {nom:.2f})")
+    assert calib.s > 1.0 and ct > cb, "temperature must lift the under-coverage"
+    # (b) distance-keyed conformal: per-bin |error| quantile -> tail bin gets a wider interval
+    hw = mondrian_conformal(dist[cal], err[cal], dist[te], alpha=0.1, n_bins=3)
+    cov_conf = float(np.mean(err[te] <= hw))
+    cov_tail = float(np.mean(err[te][tail[te]] <= hw[tail[te]]))
+    print(f"4b) mondrian conformal coverage={cov_conf:.2f} (target 0.90); tail-only={cov_tail:.2f}")
+    assert cov_conf >= 0.80, "group-conditional conformal should approach nominal coverage under shift"
     print("\nALL handoff_rule self-checks PASSED")

@@ -115,11 +115,40 @@ def ood_battery(n, rng, n_per=8):
     return out
 
 
+def violent_battery(n, rng, n_easy=34, n_hard=8,
+                    easy_depth=(0.2, 0.85), easy_contrast=(20.0, 80.0),
+                    hard_depth=(0.80, 0.95), hard_contrast=(95.0, 180.0)):
+    """The V2.1 violent-regime DEPLOYMENT population: an in-family majority + a hard extrapolation
+    tail (deeper, higher-contrast wedges that push the surrogate off its training box — the cells
+    whose error its bare self-uncertainty saturates on).
+
+    Centralizing it here is load-bearing for V2.1's calibration discipline: the SCORED battery and
+    the HELD-OUT CALIBRATION split must be *exchangeable* draws of the same distribution (same
+    generator, different seeds) for split-conformal / held-out recalibration to be valid. The draw
+    order (family_battery then the hard loop) matches the original inline construction, so seeding
+    with rng=default_rng(777) reproduces the exact pre-existing battery — keeping its DNS cache
+    valid.
+    """
+    easy = family_battery(n, rng, n_easy, depth_rng=easy_depth, contrast_rng=easy_contrast)
+    hard = [wedge_sample(n, float(rng.uniform(*hard_depth)), float(rng.uniform(*hard_contrast)))
+            for _ in range(n_hard)]
+    return easy + hard
+
+
 # ----------------------------------------------------------------------------- features
-def descriptor(grid, materials):
+def descriptor(grid, materials, connectivity=False):
     """Homogenized descriptor of the UNDAMAGED cell (the restriction-operator output).
 
     [ Voigt diag(6) | Reuss diag(6) | V-R gap(6) | soft_fraction | log10(contrast) ] -> 20-vec.
+
+    `connectivity=False` (default) reproduces the original 20-vec BYTE-IDENTICALLY — so V2.4 (and the
+    V2.1 RPF surrogate) and their cached DNS truth are unchanged. `connectivity=True` APPENDS the
+    directional conductance residual (`percolation.connectivity_residual`, 3 channels) -> 23-vec, the
+    V2.2 fix that folds connectivity INTO the descriptor/trust-scalar coordinate (so the validity
+    envelope and `u` see it) instead of a parallel boolean gate. The conductance residual is the
+    PHYSICS signal (it does not over-count dense scatter the way a topological span check does). Opt-in,
+    additive, mirroring the surrogate's `TrainCfg.beta=0/1` discipline. The connectivity term is lazily
+    imported to keep the `percolation -> violent_cells` dependency direction acyclic.
     """
     phases = np.asarray(grid).ravel()
     P = len(materials)
@@ -131,25 +160,36 @@ def descriptor(grid, materials):
     Es = np.array([E for (E, _) in materials], float)
     contrast = float(Es.max() / Es.min())
     soft_frac = float(frac[int(np.argmin(Es))]) if P > 1 else 0.0
-    return np.concatenate([np.diag(Cv), np.diag(Cr), gap,
+    base = np.concatenate([np.diag(Cv), np.diag(Cr), gap,
                            [soft_frac, np.log10(contrast)]]).astype(np.float64)
+    if not connectivity:
+        return base
+    from percolation import connectivity_residual               # lazy: avoids an import cycle
+    return np.concatenate([base, connectivity_residual(grid, materials)]).astype(np.float64)
 
 
-def percolates(grid, materials, axis=None):
+def percolates(grid, materials, axis=None, connectivity=1):
     """Does the SOFT phase form a connected cluster spanning two opposite faces?
 
     Volume-fraction homogenization (hence the descriptor envelope) is blind to connectivity:
     a thin connected seam destroys stiffness out of proportion to its volume (ARCHITECTURE
-    Risk: percolation; V2.2). This 6-connectivity span test is the architecture's prescribed
-    hard guard for that blind spot — it catches the percolating seam the envelope misses, while
-    leaving non-spanning wedges/blobs untouched.
+    Risk: percolation; V2.2). This span test is the architecture's prescribed hard guard for that
+    blind spot — it catches the percolating seam the envelope misses, while leaving non-spanning
+    wedges/blobs untouched.
+
+    `connectivity` selects the voxel adjacency rule (scipy `generate_binary_structure(3, c)`):
+    `1` = 6-connectivity (faces only) — the DEFAULT, preserving the original V2.4/V2.1 behaviour
+    byte-for-byte; `3` = 26-connectivity (the hardened V2.2 rule) — also links face/edge/corner
+    diagonals so a thin DIAGONAL soft path that is only corner-connected (which the 6-rule misses,
+    forcing the old `thickness=3` crutch) still registers.
     """
     Es = np.array([E for (E, _) in materials], float)
     soft = int(np.argmin(Es))
     mask = (np.asarray(grid) == soft)
     if not mask.any():
         return False
-    lab, _ = ndimage.label(mask)
+    struct = ndimage.generate_binary_structure(3, connectivity)
+    lab, _ = ndimage.label(mask, structure=struct)
     axes = [axis] if axis is not None else range(3)
     for ax in axes:
         lo = set(np.unique(lab.take(0, axis=ax))) - {0}
@@ -157,6 +197,30 @@ def percolates(grid, materials, axis=None):
         if lo & hi:
             return True
     return False
+
+
+def spanning_cluster_fraction(grid, materials, axis=None, connectivity=3):
+    """Graded discrete companion to the boolean `percolates`: the fraction of the SOFT phase that
+    lies in a face-spanning cluster (0 if nothing spans; -> 1 for a fully connected seam). Uses
+    26-connectivity by default so thin diagonal soft paths register. A smooth proxy for "how
+    connected" that complements the continuous conductance residual.
+    """
+    Es = np.array([E for (E, _) in materials], float)
+    soft = int(np.argmin(Es))
+    mask = (np.asarray(grid) == soft)
+    if not mask.any():
+        return 0.0
+    struct = ndimage.generate_binary_structure(3, connectivity)
+    lab, _ = ndimage.label(mask, structure=struct)
+    axes = [axis] if axis is not None else range(3)
+    spanning = set()
+    for ax in axes:
+        lo = set(np.unique(lab.take(0, axis=ax))) - {0}
+        hi = set(np.unique(lab.take(-1, axis=ax))) - {0}
+        spanning |= (lo & hi)
+    if not spanning:
+        return 0.0
+    return float(np.isin(lab, list(spanning)).sum()) / float(mask.sum())
 
 
 def region_graph(grid, materials, R=4):
@@ -192,7 +256,8 @@ def region_graph(grid, materials, R=4):
     return node_feats.astype(np.float64), edge_index
 
 
-DESCRIPTOR_DIM = 20
+DESCRIPTOR_DIM = 20                 # fraction-only descriptor (connectivity=False)
+DESCRIPTOR_DIM_CONNECTIVITY = 23    # + directional conductance residual g_perc(3) (connectivity=True)
 NODE_FEAT_DIM = 2
 
 
@@ -209,6 +274,11 @@ if __name__ == "__main__":
     d = descriptor(fam[0].grid, fam[0].materials)
     print(f"2) descriptor dim = {d.size} (expect {DESCRIPTOR_DIM}); first cell:\n   {d}")
     assert d.size == DESCRIPTOR_DIM
+    # connectivity=True APPENDS 3 channels and leaves the first 20 BYTE-IDENTICAL (reproduction).
+    dc = descriptor(fam[0].grid, fam[0].materials, connectivity=True)
+    assert dc.size == DESCRIPTOR_DIM_CONNECTIVITY and np.array_equal(dc[:DESCRIPTOR_DIM], d), \
+        "connectivity=True must append channels without disturbing the original 20-vec"
+    print(f"   connectivity=True -> dim {dc.size}; appended g_perc = {np.round(dc[DESCRIPTOR_DIM:],3)}")
 
     nf, ei = region_graph(fam[0].grid, fam[0].materials, R=4)
     print(f"3) region graph: nodes {nf.shape}, edges {ei.shape}")
@@ -226,4 +296,15 @@ if __name__ == "__main__":
     print(f"4) descriptor separability: family max-z median={np.median(z_fam):.2f}, "
           f"OOD max-z median={np.median(z_ood):.2f}")
     assert np.median(z_ood) > np.median(z_fam), "OOD should sit further from the family mean"
+
+    # 5) violent_battery centralizes the V2.1 battery — verify it reproduces the original inline
+    #    construction byte-for-byte (so the cached DNS truth stays valid).
+    b1 = violent_battery(n, np.random.default_rng(777))
+    cr = np.random.default_rng(777)
+    b0 = (family_battery(n, cr, 34)
+          + [wedge_sample(n, float(cr.uniform(0.80, 0.95)), float(cr.uniform(95.0, 180.0)))
+             for _ in range(8)])
+    assert len(b1) == len(b0) and all(np.array_equal(a.grid, g.grid) for a, g in zip(b1, b0)), \
+        "violent_battery(seed=777) must reproduce the original inline battery (DNS cache stays valid)"
+    print(f"5) violent_battery reproduces the original {len(b1)}-cell battery: OK")
     print("\nALL violent_cells self-checks PASSED")

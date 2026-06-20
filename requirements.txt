@@ -1,0 +1,9 @@
+torch
+warp-lang
+taichi
+numpy
+scipy
+matplotlib
+jupyter
+nbconvert
+cupy-cuda13x

@@ -7,3 +7,6 @@ matplotlib
 jupyter
 nbconvert
 cupy-cuda13x
+scikit-image
+trimesh
+pygltflib

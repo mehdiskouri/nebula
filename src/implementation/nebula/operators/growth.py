@@ -64,6 +64,28 @@ class GrowthParams:
     heartwood_age: int = 8     # seasons before sapwood chemically transitions to heartwood
     reaction_gain: float = 0.4         # extra thickening per unit bending stress proxy (Wolff)
     reaction_eta: float = 0.3          # Wolff fully-stressed exponent (V1.7: multiplicative)
+    # --- continuous-space growth: the architecture's real decision rule (ARCHITECTURE §III.1):
+    #     field-biased L-system COUPLED TO SPACE-COLONIZATION (limbs pulled toward open space/light),
+    #     with gravitropism + apical dominance + ROOT TIPS (roots-toward-moisture, §III.7).
+    sc_height: float = 5.0      # target tree height (world units)
+    sc_trunk_h: float = 0.34    # bare-trunk fraction of height before the crown begins
+    sc_crown_cz: float = 0.66   # crown center height (fraction of height)
+    sc_crown_r: float = 0.42    # crown radius (fraction of height)
+    sc_crown_stretch: float = 1.25     # vertical stretch of the crown attractor envelope (egg shape)
+    sc_n_canopy: int = 1100     # canopy attractor count (light / open space)
+    sc_root_depth: float = 0.42  # root-zone depth (fraction of height)
+    sc_root_r: float = 0.5      # root-zone radius (fraction of height)
+    sc_n_roots: int = 260       # root attractor count (moisture)
+    sc_step: float = 0.028      # internode step length (fraction of height) -> continuous direction
+    sc_influence: float = 9.0   # attractor influence radius (x step)
+    sc_kill: float = 1.8        # attractor kill radius (x step)
+    sc_up_tropism: float = 0.22  # canopy gravitropism/phototropism (pull toward +z)
+    sc_root_tropism: float = 0.55  # root gravitropism (pull toward -z) + outward
+    sc_max_iter: int = 700      # colonization iterations
+    sc_max_nodes: int = 14000   # node budget
+    pipe_exp: float = 2.3       # pipe-model exponent: r_parent = (sum r_child^p)^(1/p) (taper/flare)
+    r_leaf: float = 0.01        # tip radius (pipe-model leaf)
+    heart_frac: float = 0.62    # heartwood radius fraction at the oldest wood
 
 
 def params_id(gp: GrowthParams):
@@ -341,23 +363,32 @@ def op_reaction_wood(pos, parent, gen, gp: GrowthParams):
 
 
 def grow_tree(seed=0, age=None, gp: GrowthParams = GrowthParams(), lod=None, cuts=None):
-    """Run the five growth/process operators to (age, LOD) -> a TreeModel.
+    """Grow a realistic tree via the architecture's real decision rule (ARCHITECTURE §III.1):
+    continuous-space colonization (limbs pulled toward light/open space) + gravitropism + apical
+    dominance + ROOT TIPS + pipe-model radii. Deterministic in (seed, params, age).
 
-    age defaults to gp.max_gen; lod defaults to gp.max_order. `cuts` applies a write-back
-    (recorded sever) so growth heals around the wound (V1.8). Deterministic in (seed, params,
-    age, lod, cuts) via hashed sub-seeds.
+    The five growth/process operators map onto it: (1) apical extension + (2) branching ARE the
+    space-colonization front; (3) cambium taper is the pipe model (radius from supported flow);
+    (4) reaction wood is the Wolff stress proxy; (5) heartwood is the oldest (low-gen) inner wood.
+    The lattice L-system in this module (grow/full_trace/evaluate + write-back) remains the verified
+    V1.8 memoization/heal mechanism; grow_tree_lattice exposes it as a TreeModel for that path.
     """
+    from .space_colonization import grow_tree_sc
+    return grow_tree_sc(seed=seed, age=age, gp=gp)
+
+
+def grow_tree_lattice(seed=0, age=None, gp: GrowthParams = GrowthParams(), lod=None, cuts=None):
+    """The frozen V1.8 lattice-L-system path as a TreeModel (memoization + write-back/heal demo).
+    Kept for the verified growth-trace mechanism; NOT the realistic generator (see grow_tree)."""
     age = gp.max_gen if age is None else int(age)
     lod = gp.max_order if lod is None else int(lod)
     trace = grow(age, lod, cuts=cuts, gp=gp, seed=seed, cache=None)
-    pos, parent, order, gen = build_skeleton(trace, gp)                  # ops 1+2
-    radius, r_bark = op_cambium_rings(order, gen, age, gp)               # op 3
-    reaction, mult = op_reaction_wood(pos, parent, gen, gp)              # op 4
-    radius = radius * mult
-    r_bark = r_bark * mult
+    pos, parent, order, gen = build_skeleton(trace, gp)
+    radius, r_bark = op_cambium_rings(order, gen, age, gp)
+    reaction, mult = op_reaction_wood(pos, parent, gen, gp)
+    radius = radius * mult; r_bark = r_bark * mult
     taper = gp.order_taper ** order.astype(float)
-    r_heart = op_heartwood_transition(gen, age, gp, taper) * mult        # op 5
-    r_heart = np.minimum(r_heart, r_bark)                               # heartwood inside sapwood
+    r_heart = np.minimum(op_heartwood_transition(gen, age, gp, taper) * mult, r_bark)
     return TreeModel(seed, age, gp, pos, parent, order, gen, radius, r_heart, r_bark, reaction)
 
 

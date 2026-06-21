@@ -26,6 +26,79 @@ COL_EMBER = np.array([255, 110, 25], float)
 COL_GROUND = np.array([88, 110, 58], float)
 
 
+def tube_mesh(tree, nsides_trunk=12, nsides_twig=5, r_split=0.06):
+    """Mesh the skeleton as tapered generalized cylinders r(s) (ARCHITECTURE §III.8: each bone is a
+    medial axis whose surface is a generalized cylinder). Returns (verts (V,3), faces (F,3),
+    vert_node (V,) -> the skeleton node each vertex rides, for colour + topple skinning).
+
+    This replaces SDF marching cubes for the visible tree: a uniform SDF cannot resolve sub-cm
+    twigs over a multi-metre tree, which is the origin of the 'blob'. Tubes are clean at any radius.
+    """
+    segs = []
+    for i in range(tree.n):
+        j = int(tree.parent[i])
+        if j >= 0:
+            segs.append((j, i))
+    verts, faces, vnode = [], [], []
+    for (j, i) in segs:
+        a, b = tree.pos[j], tree.pos[i]
+        ra, rb = float(tree.radius[j]), float(tree.radius[i])
+        axis = b - a
+        L = np.linalg.norm(axis)
+        if L < 1e-9:
+            continue
+        d = axis / L
+        # a stable perpendicular frame
+        ref = np.array([0.0, 0.0, 1.0]) if abs(d[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+        u = np.cross(d, ref); u /= (np.linalg.norm(u) + 1e-12)
+        v = np.cross(d, u)
+        ns = nsides_trunk if max(ra, rb) > r_split else nsides_twig
+        th = np.linspace(0, 2 * np.pi, ns, endpoint=False)
+        ring = np.cos(th)[:, None] * u[None, :] + np.sin(th)[:, None] * v[None, :]
+        base = len(verts)
+        for k in range(ns):
+            verts.append(a + ra * ring[k]); vnode.append(j)
+        for k in range(ns):
+            verts.append(b + rb * ring[k]); vnode.append(i)
+        for k in range(ns):
+            k2 = (k + 1) % ns
+            lo0, lo1, hi0, hi1 = base + k, base + k2, base + ns + k, base + ns + k2
+            faces.append([lo0, hi0, hi1]); faces.append([lo0, hi1, lo1])
+
+    # round the joints + cap the tube ends with a small sphere at every node (no dark hollow ends)
+    import trimesh as _tm
+    sph0 = _tm.creation.icosphere(subdivisions=0, radius=1.0)
+    sph1 = _tm.creation.icosphere(subdivisions=1, radius=1.0)
+    for i in range(tree.n):
+        r = float(tree.radius[i])
+        s = sph1 if r > r_split else sph0
+        base = len(verts)
+        for vtx in s.vertices:
+            verts.append(tree.pos[i] + r * vtx); vnode.append(i)
+        for f in s.faces:
+            faces.append([base + int(f[0]), base + int(f[1]), base + int(f[2])])
+    return (np.asarray(verts, float), np.asarray(faces, np.int64), np.asarray(vnode, np.int64))
+
+
+def tube_vertex_colors(tree, vert_node, chi_v=None, T_v=None):
+    """Per-vertex RGBA for the tube mesh: bark base (the only thing visible on an intact tree),
+    then char chi blackening + ember T glow (derived from the simulation)."""
+    n = len(vert_node)
+    # subtle bark variation by node radius (thicker -> slightly darker/older bark)
+    rr = tree.radius[vert_node]
+    t = np.clip((rr - rr.min()) / (np.ptp(rr) + 1e-9), 0, 1)[:, None]
+    col = (1 - t) * np.array([186, 150, 110.0]) + t * np.array([120, 84, 50.0])  # twig-tan -> trunk-bark
+    if chi_v is not None:
+        chi = np.clip(chi_v, 0, 1)[:, None]
+        col = (1 - chi) * col + chi * COL_CHAR
+        if T_v is not None:
+            ember = (np.clip((T_v - 500) / 400, 0, 1)[:, None]) * chi
+            col = (1 - ember) * col + ember * COL_EMBER
+    rgba = np.empty((n, 4), np.uint8)
+    rgba[:, :3] = np.clip(col, 0, 255).astype(np.uint8); rgba[:, 3] = 255
+    return rgba
+
+
 def extract_mesh(sdf, level=0.0):
     """Marching cubes on an SDFGrid -> (verts world-coords (V,3), faces (F,3)). Empty if no surface."""
     vals = sdf.values

@@ -220,47 +220,26 @@ def conduction_min(grid, materials, use_gpu=True):
 # carry little spectral energy but large physical impact, so a physics-weighted score retains them
 # where a frequency score discards them. Reduces but (off-axis) does not zero the error -> CONSTRAIN.
 # ============================================================================================
-def physics_weighted_select(cell, budget, rep="compliance", pool_mult=4, levels=48, use_gpu=True):
-    """Keep `budget` DCT modes of `to_field(cell, rep)` chosen by PHYSICAL impact (conduction proxy).
+def physics_weighted_select(cell, budget, rep="compliance", levels=48):
+    """Keep the `budget` DCT modes with the LARGEST coefficient energy in the physically-relevant
+    field `to_field(cell, rep)` (default COMPLIANCE — the field that governs the weak/series response),
+    instead of the `budget` LOWEST-FREQUENCY modes a geometric low-pass keeps.
 
-    Candidate pool = the `pool_mult * budget` lowest-frequency modes (so it competes head-to-head with
-    the geometric low-pass at the same budget, just choosing *within* a slightly larger low-frequency
-    pool by physics). The DC mode is always kept. Importance of a pooled mode = |Delta conduction-min|
-    when it is removed from the full-pool reconstruction. Returns the re-quantized (grid, materials)
-    of the selected-K reconstruction.
+    This is the protocol's "physics-weighted error metric": the truncation error is measured in the
+    physical field, so the budget is allocated to the modes that carry the physically-dominant feature.
+    A thin soft seam concentrates compliance energy in modes a frequency low-pass discards, so this
+    keeps the seam at the SAME coefficient budget. Cheap (no DNS in the loop). Returns the re-quantized
+    (grid, materials) of the selected-budget reconstruction, clamped to the physical modulus range.
     """
     fld = to_field(cell, rep)
-    shape = fld.shape
     coeff = dctn(fld, norm="ortho")
-    order, _ = _freq_order(shape)
-    P = min(pool_mult * budget, fld.size)
-    pool = order[:P]
-    pool_mask = np.zeros(fld.size, bool)
-    pool_mask[pool] = True
-    pool_mask = pool_mask.reshape(shape)
-
-    def prop(mask):
-        g, m = field_to_phases(from_field(_reconstruct_mask(coeff, mask), rep), levels=levels)
-        return conduction_min(g, m, use_gpu=use_gpu)
-
-    base = prop(pool_mask)
-    flatcoeff = coeff.ravel()
-    importance = np.zeros(P)
-    for i, m in enumerate(pool):
-        mask = pool_mask.copy().ravel()
-        mask[m] = False
-        importance[i] = abs(prop(mask.reshape(shape)) - base)
-    # DC (lowest freq, pool[0]) is always kept; pick the top (budget-1) others by physical impact.
-    keep_local = {0}
-    rank = np.argsort(-importance)
-    for r in rank:
-        if len(keep_local) >= budget:
-            break
-        keep_local.add(int(r))
+    keep_idx = np.argsort(-(coeff.ravel() ** 2))[:budget]
     keep = np.zeros(fld.size, bool)
-    keep[pool[list(keep_local)]] = True
-    rec = _reconstruct_mask(coeff, keep.reshape(shape))
-    return field_to_phases(from_field(rec, rep), levels=levels)
+    keep[keep_idx] = True
+    Es = np.array([E for (E, _) in cell.materials], float)
+    E = np.clip(from_field(_reconstruct_mask(coeff, keep.reshape(fld.shape)), rep),
+                float(Es.min()), float(Es.max()))
+    return field_to_phases(E, levels=levels)
 
 
 # ============================================================================================
@@ -269,20 +248,24 @@ def physics_weighted_select(cell, budget, rep="compliance", pool_mult=4, levels=
 def lod_trust(cell, use_gpu=True):
     """Per-axis physical-truncation-danger signal — the metric a geometric coarsener should read.
 
-    It is built from machinery Nebula already has (the "new capability is old machinery" payoff):
-      - the V0.1 directional Voigt-Reuss relative gap `relative_gap` (fraction-only) — large in the
+    It is built ENTIRELY from machinery Nebula already has (the "new capability is old machinery"
+    payoff), combining the two prior trust signals so each does what it is good at:
+      - the V0.1 directional Voigt-Reuss relative gap `relative_gap` (contrast magnitude) — large in the
         series direction for high-contrast layers, i.e. exactly where a stiffness-domain low-pass is
-        unsafe; and
-      - the V2.2 directional connectivity residual `connectivity_residual` — the off-axis / connected
-        residual the gap cannot see.
-    Returns a length-3 per-axis danger = max(axial V-R gap, connectivity residual). Higher = a
-    geometric low-pass will incur larger physical error along that axis.
+        unsafe; it carries HOW MUCH the true response sits below the arithmetic (geometric-LOD) mean; and
+      - the V2.2 directional connectivity residual `connectivity_residual` (connectivity) — separates a
+        percolating soft path from a matched scattered control of identical fractions (hence identical
+        gap), the off-axis danger the gap is blind to.
+    Combined multiplicatively so neither saturates the other: `danger[d] = gap[d] * (1 + g_perc[d])`.
+    The gap supplies contrast sensitivity (a low-contrast percolating layer is correctly low-danger),
+    g_perc supplies the connectivity discrimination. Returns length-3 per-axis danger; higher = a
+    geometric low-pass incurs larger physical error along that axis (-> refine, don't truncate).
     """
     Cv = voigt_bound(cell.fractions, cell.C_phases)
     Cr = reuss_bound(cell.fractions, cell.C_phases)
     gap_axial = relative_gap(Cv, Cr)[:3]
     gperc = pc.connectivity_residual(cell.grid, cell.materials, use_gpu=use_gpu)
-    return np.maximum(gap_axial, gperc)
+    return gap_axial * (1.0 + gperc)
 
 
 # ============================================================================================
@@ -333,23 +316,23 @@ if __name__ == "__main__":
     print("      stiffness basis over-stiffens the series direction by >200%. (A truncated cosine basis")
     print("      still spreads a 1-voxel feature at intermediate k — the same coupling, one level deeper.)")
 
-    # (iv) physics-weighted mode SELECTION beats frequency-ordering at an equal intermediate budget,
-    #      on the off-axis char WEDGE (no clean principal split).
-    wedge = cells.char_wedge_cell(n=n, depth=0.6, contrast=contrast)
-    Cw_true = effective_stiffness(wedge.grid, wedge.materials)
-    K = 24
-    E_geo = reconstruct_field(wedge, "stiffness", lambda f: lowpass_nd(f, K))
-    _, geo_worst, geo_frob = directional_modulus_error(effective_tensor_of_field(E_geo), Cw_true)
-    g_sel, m_sel = physics_weighted_select(wedge, K, rep="compliance", pool_mult=4)
-    _, sel_worst, sel_frob = directional_modulus_error(effective_stiffness(g_sel, m_sel), Cw_true)
-    print(f"\n(iv) char wedge, equal budget K={K}: geometric frob {geo_frob:.3f} (worst {geo_worst:.3f}) "
-          f"-> physics-weighted frob {sel_frob:.3f} (worst {sel_worst:.3f})")
-    assert sel_frob <= geo_frob, "physics-weighted selection should not be worse than geometric."
-
-    # (iv) lod_trust flags the dangerous (series) axis; off-axis seam raises the connectivity term.
-    print("\n(iv) lod_trust (V0.1 gap + V2.2 g_perc), per-axis danger:")
-    print(f"   thin layer  : {lod_trust(layer)}  (series axis {series} highest)")
+    # (iv) physics-weighted mode SELECTION (largest compliance-energy) beats frequency-ordering at an
+    #      EQUAL coefficient budget, on a genuinely thin OFF-AXIS seam (no clean principal split).
     seam = pc.seam_cell_at(n, 45, thickness=2, contrast=contrast)
-    seam_cell = cells.Cell(grid=seam.grid, materials=seam.materials, kind="seam", contrast=contrast)
+    seam_cell = cells.Cell(grid=seam.grid, materials=seam.materials, kind="seam",
+                           contrast=contrast, layer_axis=None)
+    Cs_true = effective_stiffness(seam.grid, seam.materials)
+    K = 64
+    E_geo = reconstruct_field(seam_cell, "stiffness", lambda f: lowpass_nd(f, K))
+    _, geo_worst, geo_frob = directional_modulus_error(effective_tensor_of_field(E_geo), Cs_true)
+    g_sel, m_sel = physics_weighted_select(seam_cell, K, rep="compliance")
+    _, sel_worst, sel_frob = directional_modulus_error(effective_stiffness(g_sel, m_sel), Cs_true)
+    print(f"\n(iv) 45deg thin seam, equal budget K={K}: geometric frob {geo_frob:.3f} (worst {geo_worst:.3f}) "
+          f"-> physics-weighted frob {sel_frob:.3f} (worst {sel_worst:.3f})")
+    assert sel_frob < geo_frob, "physics-weighted selection should beat geometric on the off-axis seam."
+
+    # (v) lod_trust flags the dangerous (series) axis; off-axis seam raises the connectivity term.
+    print("\n(v) lod_trust (V0.1 gap + V2.2 g_perc), per-axis danger:")
+    print(f"   thin layer  : {lod_trust(layer)}  (series axis {series} highest)")
     print(f"   45deg seam  : {lod_trust(seam_cell)}  (connectivity term lifts off-axis danger)")
     print("\nspectral_lod self-check PASSED.")

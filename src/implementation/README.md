@@ -55,6 +55,13 @@ PYTHONPATH=src/implementation:src/verification/oracles python -m regression.test
 | `operators/fire_taichi` | Taichi kernel for the conduction+Arrhenius field update (AOT bridge) | **new** (Part V) |
 | `operators/integrators` | rate sub-stepping + semi-implicit IMEX (the stiff loop) | port (V1.2) |
 | `operators/growth` | growth trace/memo/write-back + the **five growth/process operators** | port+extend (V1.8) |
+| `operators/space_colonization` | continuous-space colonization morphology (roots, pipe-model taper) | **new** (§III.1) |
+| `operators/flow` | Boussinesq buoyant flow: projection + conservative advection (the flame transport) | **new** (Tier 3, V3.1) |
+| `operators/gas_combustion` | reacting buoyant flow — the **flame** (combustion above the fuel + soot) | **new** (Tier 3, V3.2) |
+| `operators/canopy` | leaves as derived fine fuel, golden-angle phyllotaxis (the **canopy**) | **new** (Tier 3, V3.4) |
+| `operators/fine_fuel` | fine-fuel combustion — the **crown flash** (leaves burn out fast, d²-law) | **new** (Tier 3, V3.5) |
+| `render/gaussian_rasterizer` | from-scratch torch EWA Gaussian-splat rasterizer (HDR, deterministic) | **new** (Tier 3, V3.9) |
+| `render/splat` | generate the dense splat render cloud + dual-cloud skinning (V1.9) | **new** (Tier 3, V3.9) |
 | `restriction/homogenization` | Voigt/Reuss + directional estimate | port (V0.1) |
 | `restriction/jensen` | sub-cell variance ε (the Jensen correction) | port (V1.3) |
 | `restriction/percolation` | g_perc directional conductance residual + 26-conn backstop | port (V2.2) |
@@ -62,8 +69,33 @@ PYTHONPATH=src/implementation:src/verification/oracles python -m regression.test
 | `adaptive/octree`,`octree_gpu` | the one Morton octree (LOD/multigrid/far-field), CPU + Warp | port (V0.4) |
 | `adaptive/refine` | the coarse-to-fine predicate: D + hysteresis + 2:1 + interface edge | **new** (Decision #10) |
 | `mechanics/xpbd` | Constraint hyperedges solved by the color pass; char→fracture | **new** (added scope) |
-| `geometry/mesh_export` | marching cubes → glTF, colour derived from χ/T | **new** (Decision #2) |
-| `pipeline/tree_slice`,`cli` | the end-to-end deterministic scenario | **new** |
+| `geometry/mesh_export` | marching cubes / `tube_mesh` → glTF, colour derived from χ/T | **new** (Decision #2) |
+| `geometry/appearance` | derived blackbody emission + PBR surface (char/wet/soot) | **new** (Tier 3, V3.3) |
+| `geometry/bark_texture` | derived bark-fissure relief (displacement/normal/AO from radial-growth tension) | **new** (Tier 3, V3.8) |
+| `geometry/char_texture` | derived char "alligator" crackle (cell size ∝ char depth, thickness law) | **new** (Tier 3, V3.6) |
+| `pipeline/burning_scene` | the integrated burning tree → USD+VDB export + realism-acceptance gate | **new** (Tier 3, Theme E) |
+| `geometry/export` | **USD + OpenVDB** export of derived state — the path-tracer handoff | **new** (Tier 3) |
+| `pipeline/tree_slice`,`demo`,`cli` | the end-to-end deterministic scenario | **new** |
+
+**Tier 3 (realism) — ALL 9 verified + integrated.** Built and verified against independent oracles
+(`verification_notebooks/phase3/results/tier3_report.md`): flame transport (V3.1), the flame itself
+(V3.2 — stands off the fuel AND self-sustains at a physical ~1300 K, *hotter than its source*),
+blackbody/Beer–Lambert/PBR appearance (V3.3), the phyllotactic combustible canopy (V3.4), the crown flash
+(V3.5), derived char-alligator (V3.6) + bark-fissure (V3.8) relief, reflectance grounding (V3.7), tree
+morphology (V3.8 — root flare + surface roots), and the dual-cloud Gaussian-splat **preview** (V3.9). The
+integrated **`pipeline/burning_scene`** (Theme E) runs the whole scene → **USD + OpenVDB export** and a
+**realism-acceptance gate (10/10 over the derived state)**, deterministically.
+
+**Causal-fidelity model (the discipline).** Nebula LANDS the physics + morphology and exports the **derived
+state**; the beauty render is a downstream path tracer (Omniverse). So: the Gaussian-splat render
+(`render/`) is a **faithful in-engine PREVIEW** (every splat position/colour is a simulation output;
+`splat.show_physics()` recolours by raw T/χ/layer as an honest debugger) — **not** the final render. The
+handoff is `geometry/export.export_scene()` → a **USD** scene (tree mesh + derived albedo/roughness/emissive
+primvars + canopy) + an **OpenVDB** `fire.vdb` (temperature [K] + soot density) + a `manifest.json` causal
+contract (blackbody-emission + Beer–Lambert render recipe, provenance). Realism is fixed at the CAUSAL level
+(e.g. the flame's heat of combustion was corrected from the non-physical `dH_cb=60` to a physical value so
+the gas flame self-sustains at ~1300 K, *hotter than its fuel* — V3.2's thermal-realism criterion), never by
+beautifying the render. **USD via `usd-core`; the `.vdb` is written by the `/venv/vdb` conda env (OpenVDB).**
 
 ## The five growth/process operators (`operators/growth`)
 1. **apical extension** — the meristem front advances the skeleton (the L-system walk)

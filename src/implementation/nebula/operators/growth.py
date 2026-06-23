@@ -81,6 +81,7 @@ class GrowthParams:
     sc_kill: float = 1.8        # attractor kill radius (x step)
     sc_up_tropism: float = 0.22  # canopy gravitropism/phototropism (pull toward +z)
     sc_root_tropism: float = 0.55  # root gravitropism (pull toward -z) + outward
+    sc_surface_root_frac: float = 0.6  # raise the shallowest roots toward grade (visible buttress roots)
     sc_max_iter: int = 700      # colonization iterations
     sc_max_nodes: int = 14000   # node budget
     pipe_exp: float = 2.3       # pipe-model exponent: r_parent = (sum r_child^p)^(1/p) (taper/flare)

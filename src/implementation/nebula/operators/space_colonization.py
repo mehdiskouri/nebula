@@ -146,6 +146,23 @@ def _pipe_radii(pos, parent, gp):
     return np.maximum(r, gp.r_leaf)
 
 
+def _surface_roots(pos, gp):
+    """Raise the shallowest root nodes toward (and slightly above) grade — visible buttress/surface
+    roots — leaving deep roots untouched. Derived from the root-plate morphology, deterministic."""
+    z = pos[:, 2]
+    roots = z < 0
+    if not roots.any() or gp.sc_surface_root_frac <= 0:
+        return pos
+    zmin = float(z[roots].min())
+    pos = pos.copy()
+    zr = z[roots]
+    shallow = np.clip(1.0 - zr / zmin, 0.0, 1.0)              # 1 at the surface (zr→0), 0 at depth
+    lifted = zr * (1.0 - gp.sc_surface_root_frac * shallow)   # pull shallow roots up toward 0
+    lifted = np.where(shallow > 0.9, np.maximum(lifted, 0.015), lifted)   # the shallowest break grade
+    pos[roots, 2] = lifted
+    return pos
+
+
 def _depth(pos, parent, children):
     """Topological depth from root (BFS) -- used to order the pipe-model postorder."""
     n = len(pos)
@@ -200,6 +217,11 @@ def grow_tree_sc(seed=0, age=None, gp=None):
     pos = np.vstack([cpos, rpos[keep]])
     parent = np.concatenate([cpar, rpar_merged])
     gen = np.concatenate([cgen, rgen[keep] + cgen.max() + 1])  # roots are "later" generations
+
+    # SURFACE ROOTS (derived, not authored): a real tree's major structural roots run laterally
+    # near the surface (the root plate / buttress) before diving for moisture. Raise the shallowest
+    # roots toward grade so the buttress is visible, the rest keep their downward moisture-seeking.
+    pos = _surface_roots(pos, gp)
 
     order = _assign_orders(pos, parent)
     radius = _pipe_radii(pos, parent, gp)

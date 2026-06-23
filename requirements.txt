@@ -10,3 +10,9 @@ cupy-cuda13x
 scikit-image
 trimesh
 pygltflib
+pyrender
+PyOpenGL
+PyOpenGL_accelerate
+usd-core            # USD scene export (Omniverse-native handoff to the path tracer)
+# OpenVDB has no py3.13 wheel; the fire-volume .vdb is written by a separate conda env:
+#   mamba create -n vdb -c conda-forge openvdb numpy   (-> /venv/vdb/bin/python, used via subprocess)

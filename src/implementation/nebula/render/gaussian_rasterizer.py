@@ -116,8 +116,11 @@ def render(means, cov3d, colors, opacity, cam: Camera, bg=(0.03, 0.035, 0.05),
     # footprint radius (3σ) from the larger eigenvalue
     tr = cov2d[:, 0, 0] + cov2d[:, 1, 1]
     det = cov2d[:, 0, 0] * cov2d[:, 1, 1] - cov2d[:, 0, 1] ** 2
-    lam = 0.5 * tr + torch.sqrt((0.5 * tr) ** 2 - det).clamp_min(0)
-    rad = torch.clamp(3.0 * torch.sqrt(lam.clamp_min(1e-6)), 1.0, max_radius_px).ceil().long()
+    # larger eigenvalue; clamp_min INSIDE the sqrt (a near-camera splat makes the radicand a tiny
+    # negative → NaN → overflow on .long()). Also scrub NaN/inf before integerizing the radius.
+    lam = 0.5 * tr + torch.sqrt(((0.5 * tr) ** 2 - det).clamp_min(0.0))
+    rad = torch.clamp(3.0 * torch.sqrt(lam.clamp_min(1e-6)), 1.0, max_radius_px)
+    rad = torch.nan_to_num(rad, nan=1.0, posinf=float(max_radius_px)).ceil().long()
 
     # enumerate (pixel, gaussian) pairs over each footprint bbox
     pix_id, g_id, du, dv = [], [], [], []

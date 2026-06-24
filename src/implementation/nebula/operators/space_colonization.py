@@ -29,8 +29,12 @@ from scipy.spatial import cKDTree
 from ..core.determinism import rng_from_key
 
 
-def _sample_ellipsoid(rng, n, center, radii, z_stretch=1.0, zmin=None):
-    """n points roughly uniform in an axis-aligned ellipsoid (optionally clipped below zmin)."""
+def _sample_ellipsoid(rng, n, center, radii, z_stretch=1.0, zmin=None, lumpiness=0.0):
+    """n points roughly uniform in an axis-aligned ellipsoid (optionally clipped below zmin).
+
+    `lumpiness` (0..~0.6) modulates the radius by a few direction-dependent lobes so the crown is
+    LOBED, not a perfect sphere — a real canopy silhouette. Deterministic (lobes drawn from `rng`).
+    """
     pts = []
     c = np.asarray(center, float); rad = np.asarray(radii, float)
     while len(pts) < n:
@@ -41,7 +45,16 @@ def _sample_ellipsoid(rng, n, center, radii, z_stretch=1.0, zmin=None):
         if zmin is not None:
             q = q[q[:, 2] >= zmin]
         pts.extend(q.tolist())
-    return np.array(pts[:n])
+    arr = np.array(pts[:n])
+    if lumpiness > 0 and len(arr):
+        d = arr - c[None, :]
+        dn = d / (np.linalg.norm(d, axis=1, keepdims=True) + 1e-9)
+        L = 6
+        dirs = rng.normal(size=(L, 3)); dirs /= np.linalg.norm(dirs, axis=1, keepdims=True) + 1e-9
+        amp = rng.uniform(0.4, 1.0, L)
+        bump = 1.0 + lumpiness * (amp[None, :] * np.cos(np.pi * (dn @ dirs.T))).sum(1) / L
+        arr = c[None, :] + d * np.clip(bump, 0.45, 1.6)[:, None]
+    return arr
 
 
 def _colonize(start, attractors, tropism, gp, max_nodes):
@@ -235,6 +248,64 @@ def grow_tree_sc(seed=0, age=None, gp=None):
     return TreeModel(seed=seed, age=(gp.max_gen if age is None else age), params=gp,
                      pos=pos, parent=parent, order=order, gen=gen, radius=radius,
                      r_heart=r_heart, r_bark=r_bark, reaction=reaction)
+
+
+def smooth_skeleton(tree, pos_iters=16, rad_iters=8, alpha=0.6):
+    """Laplacian-smooth the skeleton for a natural, flowing tree (post-grow rendering refinement).
+
+    Space colonization leaves a JAGGED path (≈66° kinks between consecutive internodes) → the mesh
+    reads as a stack of cylinders. Smoothing each node toward the mean of its parent+children (root
+    pinned) turns the zig-zag into smooth branches; smoothing the radii turns the steppy pipe-model
+    jumps into a continuous taper (thick base → thin twigs). Topology/order/gen are untouched, so the
+    verified growth structure (and V3.4 leaf attachment) is preserved.
+    """
+    import dataclasses
+    import scipy.sparse as sp
+    par = tree.parent
+    n = tree.n
+    children = [[] for _ in range(n)]
+    for i in range(n):
+        if par[i] >= 0:
+            children[par[i]].append(i)
+    rows, cols, w = [], [], []
+    for i in range(n):
+        nb = ([par[i]] if par[i] >= 0 else []) + children[i]
+        if par[i] < 0 or not nb:
+            rows.append(i); cols.append(i); w.append(1.0)        # pin root / isolated
+            continue
+        for j in nb:
+            rows.append(i); cols.append(j); w.append(1.0 / len(nb))
+    A = sp.csr_matrix((w, (rows, cols)), shape=(n, n))
+    fixed = (par < 0)
+    pos = tree.pos.astype(float).copy()
+    for _ in range(pos_iters):
+        sm = A.dot(pos)
+        pos = np.where(fixed[:, None], pos, (1 - alpha) * pos + alpha * sm)
+    # radii: light smoothing then enforce a MONOTONE taper (a child is never thicker than its
+    # parent) by a root-order sweep — gives a clean thick-base→thin-tip taper, no ballooned twigs.
+    rad = tree.radius.astype(float).copy()
+    for _ in range(rad_iters):
+        rad = np.where(fixed, rad, 0.7 * rad + 0.3 * A.dot(rad))
+    # BASAL FLARE / root collar: blend the lower trunk up from the thick collar so the trunk reads as
+    # GROWING from the roots (a continuous buttress), not a thin cylinder dropped on a bulb. The collar
+    # radius (node 0, where trunk + roots converge) tapers smoothly into the trunk over the lowest fifth.
+    z = pos[:, 2]; ztop = float(z.max())
+    collar = float(rad[par < 0].max()) if (par < 0).any() else float(rad.max())
+    fh = 0.22 * max(ztop, 1e-3)
+    inband = (z >= -0.03) & (z < fh)
+    w = np.clip(1.0 - z[inband] / fh, 0.0, 1.0) ** 1.7
+    rad[inband] = np.maximum(rad[inband], collar * 0.92 * w)
+    order = np.argsort(_depth(tree.pos, par, children))          # root → tips
+    for i in order:
+        if par[i] >= 0:
+            rad[i] = min(rad[i], rad[par[i]])
+    # slim the fine branches/twigs (they read too thick) without touching the trunk/main limbs
+    rad = rad * np.where(rad < 0.03, 0.5, np.where(rad < 0.07, 0.78, 1.0))
+    gp = tree.params
+    r_bark = np.maximum(rad - gp.bark_thickness, 0.25 * rad)
+    heart_ratio = np.divide(tree.r_heart, np.maximum(tree.radius, 1e-9))
+    r_heart = np.minimum(heart_ratio * rad, r_bark)
+    return dataclasses.replace(tree, pos=pos, radius=rad, r_bark=r_bark, r_heart=r_heart)
 
 
 def _scaled(gp, frac):

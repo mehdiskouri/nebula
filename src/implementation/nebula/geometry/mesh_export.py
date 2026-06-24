@@ -26,29 +26,39 @@ COL_EMBER = np.array([255, 110, 25], float)
 COL_GROUND = np.array([88, 110, 58], float)
 
 
-def tube_mesh(tree, nsides_trunk=12, nsides_twig=5, r_split=0.06):
-    """Mesh the skeleton as tapered generalized cylinders r(s) (ARCHITECTURE §III.8: each bone is a
-    medial axis whose surface is a generalized cylinder). Returns (verts (V,3), faces (F,3),
-    vert_node (V,) -> the skeleton node each vertex rides, for colour + topple skinning).
+def tube_mesh(tree, nsides_trunk=16, nsides_twig=6, r_split=0.05):
+    """Mesh the skeleton as tapered generalized cylinders that TAPER TO POINTS at the tips (ARCHITECTURE
+    §III.8). Returns (verts (V,3), faces (F,3), vert_node (V,) → the skeleton node each vertex rides).
 
-    This replaces SDF marching cubes for the visible tree: a uniform SDF cannot resolve sub-cm
-    twigs over a multi-metre tree, which is the origin of the 'blob'. Tubes are clean at any radius.
+    Branch tips taper to a near-point (pointy twigs, not blunt sphere-capped stubs), the root↔trunk
+    junction flows continuously through node 0 (no sphere base), and there are NO icosphere caps — the
+    spheres at every node were the 'blob endings'. Each tube ring twists with a stable parallel frame
+    so consecutive segments line up; child tubes start slightly inside the parent to hide the joint.
     """
-    segs = []
+    par = tree.parent
+    nchild = np.zeros(tree.n, int)
     for i in range(tree.n):
-        j = int(tree.parent[i])
-        if j >= 0:
-            segs.append((j, i))
+        if par[i] >= 0:
+            nchild[par[i]] += 1
+    is_tip = nchild == 0
+    rmesh = tree.radius.astype(float).copy()
+    rmesh[is_tip] = np.maximum(0.0015, 0.015 * rmesh[is_tip])      # tips → near-points (pointy)
+
     verts, faces, vnode = [], [], []
-    for (j, i) in segs:
-        a, b = tree.pos[j], tree.pos[i]
-        ra, rb = float(tree.radius[j]), float(tree.radius[i])
+    for i in range(tree.n):
+        j = int(par[i])
+        if j < 0:
+            continue
+        a, b = tree.pos[j].copy(), tree.pos[i]
+        ra, rb = float(rmesh[j]), float(rmesh[i])
         axis = b - a
         L = np.linalg.norm(axis)
         if L < 1e-9:
             continue
         d = axis / L
-        # a stable perpendicular frame
+        # overlap the child start into the parent so the joint has no crease/gap
+        if par[j] >= 0:
+            a = a - d * (0.6 * ra)
         ref = np.array([0.0, 0.0, 1.0]) if abs(d[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
         u = np.cross(d, ref); u /= (np.linalg.norm(u) + 1e-12)
         v = np.cross(d, u)
@@ -58,26 +68,157 @@ def tube_mesh(tree, nsides_trunk=12, nsides_twig=5, r_split=0.06):
         base = len(verts)
         for k in range(ns):
             verts.append(a + ra * ring[k]); vnode.append(j)
-        for k in range(ns):
-            verts.append(b + rb * ring[k]); vnode.append(i)
-        for k in range(ns):
-            k2 = (k + 1) % ns
-            lo0, lo1, hi0, hi1 = base + k, base + k2, base + ns + k, base + ns + k2
-            faces.append([lo0, hi0, hi1]); faces.append([lo0, hi1, lo1])
-
-    # round the joints + cap the tube ends with a small sphere at every node (no dark hollow ends)
-    import trimesh as _tm
-    sph0 = _tm.creation.icosphere(subdivisions=0, radius=1.0)
-    sph1 = _tm.creation.icosphere(subdivisions=1, radius=1.0)
-    for i in range(tree.n):
-        r = float(tree.radius[i])
-        s = sph1 if r > r_split else sph0
-        base = len(verts)
-        for vtx in s.vertices:
-            verts.append(tree.pos[i] + r * vtx); vnode.append(i)
-        for f in s.faces:
-            faces.append([base + int(f[0]), base + int(f[1]), base + int(f[2])])
+        if is_tip[i]:                                              # collapse the tip ring to a point
+            verts.append(b); vnode.append(i)
+            for k in range(ns):
+                faces.append([base + k, base + ((k + 1) % ns), base + ns])   # cone to the tip
+        else:
+            for k in range(ns):
+                verts.append(b + rb * ring[k]); vnode.append(i)
+            for k in range(ns):
+                k2 = (k + 1) % ns
+                faces.append([base + k, base + ns + k, base + ns + k2])
+                faces.append([base + k, base + ns + k2, base + k2])
     return (np.asarray(verts, float), np.asarray(faces, np.int64), np.asarray(vnode, np.int64))
+
+
+def _catmull_rom(P, sub):
+    """Subdivide a polyline P (m,3) with Catmull-Rom into a smooth curve (sub points per segment).
+    Returns the dense points and the fractional original-index per dense point (for radius interp)."""
+    m = len(P)
+    if m < 2:
+        return P.copy(), np.zeros(len(P))
+    ext = np.vstack([2 * P[0] - P[1], P, 2 * P[-1] - P[-2]])     # phantom endpoints
+    out, frac = [], []
+    for i in range(m - 1):
+        p0, p1, p2, p3 = ext[i], ext[i + 1], ext[i + 2], ext[i + 3]
+        for s in range(sub):
+            tt = s / sub
+            t2, t3 = tt * tt, tt * tt * tt
+            out.append(0.5 * ((2 * p1) + (-p0 + p2) * tt + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
+                              + (-p0 + 3 * p1 - 3 * p2 + p3) * t3))
+            frac.append(i + tt)
+    out.append(P[-1]); frac.append(m - 1.0)
+    return np.array(out), np.array(frac)
+
+
+def swept_tube_mesh(tree, sub=3, nsides_trunk=20, nsides_twig=7, r_split=0.045):
+    """Mesh the tree as continuous SWEPT TUBES along whole branch paths — the organic, grown look.
+
+    Per-segment cylinders crease at every node (the 'stacked cylinders'); instead each path (root→tip
+    chain) is a single generalized cylinder: a Catmull-Rom-smoothed centreline, a parallel-transport
+    frame (no twist, rings stay aligned so the surface is seamless), a smoothly interpolated radius
+    that tapers to a point at the tip. Child paths begin inside the parent so the joints flow. Returns
+    (verts, faces, vert_node)."""
+    par = tree.parent; pos = tree.pos.astype(float); rad = tree.radius.astype(float)
+    n = tree.n
+    children = [[] for _ in range(n)]
+    for i in range(n):
+        if par[i] >= 0:
+            children[par[i]].append(i)
+    nchild = np.array([len(c) for c in children])
+    primary = {i: (max(children[i], key=lambda c: rad[c]) if children[i] else -1) for i in range(n)}
+    is_start = np.zeros(n, bool)
+    for i in range(n):
+        if par[i] < 0:
+            is_start[i] = True
+        elif primary[par[i]] != i:
+            is_start[i] = True
+    verts, faces, vnode = [], [], []
+    for s in np.where(is_start)[0]:
+        chain = []
+        cur = int(s)
+        while cur != -1:
+            chain.append(cur)
+            cur = primary[cur]
+        nodes = np.array(chain)
+        P = pos[nodes].astype(float).copy(); R = rad[nodes].copy()
+        R[-1] = max(0.0015, 0.01 * R[-1])                   # taper the path tip to a point
+        # overlap a short stub back INTO the parent at the CHILD radius (thin) so junctions don't
+        # blob — child tubes must not inherit the thick parent radius at the joint.
+        if par[s] >= 0:
+            d = pos[s] - pos[par[s]]; d = d / (np.linalg.norm(d) + 1e-9)
+            P = np.vstack([pos[s] - d * (1.3 * R[0]), P])
+            R = np.concatenate([[R[0]], R]); nodes = np.concatenate([[int(s)], nodes])
+        if len(nodes) < 2:
+            continue
+        Pd, frac = _catmull_rom(P, sub)
+        Rd = np.interp(frac, np.arange(len(nodes)), R)
+        # taper the radius CONTINUOUSLY base→tip (the pipe model leaves uniform-thick limb 'stubs');
+        # blend with a base→tip taper, then force a monotone thinning so every branch comes to a point.
+        tt = (frac - frac[0]) / (frac[-1] - frac[0] + 1e-9)
+        Rd = 0.55 * Rd + 0.45 * (R[0] * (1 - tt) + R[-1] * tt)
+        Rd = np.minimum.accumulate(Rd)
+        nd = nodes[np.clip(np.round(frac).astype(int), 0, len(nodes) - 1)]
+        # parallel-transport frame along the dense centreline
+        tang = np.gradient(Pd, axis=0)
+        tang /= (np.linalg.norm(tang, axis=1, keepdims=True) + 1e-9)
+        ref = np.array([0.0, 0.0, 1.0]) if abs(tang[0, 2]) < 0.9 else np.array([1.0, 0, 0])
+        u0 = np.cross(tang[0], ref); u0 /= np.linalg.norm(u0) + 1e-9
+        U = [u0]
+        for t in range(1, len(Pd)):
+            u = U[-1] - tang[t] * (U[-1] @ tang[t])          # project onto the new normal plane
+            nrm = np.linalg.norm(u)
+            U.append(u / nrm if nrm > 1e-6 else U[-1])
+        U = np.array(U); V = np.cross(tang, U)
+        ns = nsides_trunk if R.max() > r_split else nsides_twig
+        th = np.linspace(0, 2 * np.pi, ns, endpoint=False)
+        ring = (np.cos(th)[None, :, None] * U[:, None, :] + np.sin(th)[None, :, None] * V[:, None, :])
+        rverts = Pd[:, None, :] + Rd[:, None, None] * ring   # (T, ns, 3)
+        T = len(Pd); b0 = len(verts)
+        for t in range(T):
+            for k in range(ns):
+                verts.append(rverts[t, k]); vnode.append(int(nd[t]))
+        for t in range(T - 1):
+            for k in range(ns):
+                k2 = (k + 1) % ns
+                a = b0 + t * ns + k; bb = b0 + t * ns + k2
+                c = b0 + (t + 1) * ns + k; dd = b0 + (t + 1) * ns + k2
+                faces.append([a, c, dd]); faces.append([a, dd, bb])
+        tip = len(verts); verts.append(Pd[-1]); vnode.append(int(nd[-1]))   # close the tip to a point
+        for k in range(ns):
+            faces.append([b0 + (T - 1) * ns + k, tip, b0 + (T - 1) * ns + ((k + 1) % ns)])
+    return np.asarray(verts, float), np.asarray(faces, np.int64), np.asarray(vnode, np.int64)
+
+
+def leaf_cards(canopy, size=0.12, seed=7, curl=0.28):
+    """Flat leaf BLADES attached to the twigs: a diamond (narrow base → widest middle → pointed tip)
+    per leaf, oriented outward + a gravity droop + a phyllotactic tilt. Returns (verts, faces,
+    leaf_id) where leaf_id maps each vertex to its leaf (for per-leaf char colour + dropping).
+    Every blade's base sits ON its twig, so none float detached."""
+    from ..core.determinism import rng_from_key
+    n = canopy.n
+    if n == 0:
+        return np.zeros((0, 3)), np.zeros((0, 3), np.int64), np.zeros(0, np.int64)
+    rng = rng_from_key("leafcard", seed, n)
+    base = canopy.pos.astype(float)
+    nrm = canopy.normal / (np.linalg.norm(canopy.normal, axis=1, keepdims=True) + 1e-9)
+    # leaf direction: outward + downward droop + a little scatter (phyllotaxis already in azimuth)
+    ld = nrm + np.array([0, 0, -0.45]) + 0.35 * rng.standard_normal((n, 3))
+    ld /= (np.linalg.norm(ld, axis=1, keepdims=True) + 1e-9)
+    up = np.array([0, 0, 1.0])
+    wd = np.cross(ld, up); wn = np.linalg.norm(wd, axis=1, keepdims=True)
+    wd = np.where(wn < 1e-6, np.cross(ld, np.array([1.0, 0, 0])), wd)
+    wd /= (np.linalg.norm(wd, axis=1, keepdims=True) + 1e-9)
+    length = (size * (0.7 + 0.6 * rng.random(n)))[:, None]
+    width = 0.42 * length
+    # smooth lanceolate leaf template: (s along midrib, half-width fraction) — rounded, pointed tip
+    T = np.array([[0.0, 0.05], [0.0, -0.05], [0.28, 0.5], [0.28, -0.5],
+                  [0.60, 0.42], [0.60, -0.42], [1.0, 0.0]])
+    Tf = np.array([[0, 2, 3], [0, 3, 1], [2, 4, 5], [2, 5, 3], [4, 6, 5]])
+    m = len(T)
+    cn = np.cross(ld, wd)                            # leaf-card normal (for out-of-plane curl)
+    cn /= (np.linalg.norm(cn, axis=1, keepdims=True) + 1e-9)
+    s = T[:, 0][None, :, None]; wf = T[:, 1][None, :, None]
+    # cup the blade out of plane: edges lift, midrib dips, tip droops → leaves have VOLUME, not flat
+    coff = curl * (T[:, 1] ** 2 - 0.12 - 0.25 * T[:, 0])[None, :, None]
+    verts = (base[:, None, :] + ld[:, None, :] * (length[:, None] * s)
+             + wd[:, None, :] * (width[:, None] * wf)
+             + cn[:, None, :] * (length[:, None] * coff)).reshape(-1, 3)
+    idx = np.arange(n)
+    faces = (Tf[None, :, :] + (m * idx)[:, None, None]).reshape(-1, 3)
+    leaf_id = np.repeat(idx, m)
+    return verts.astype(float), faces.astype(np.int64), leaf_id
 
 
 def tube_vertex_colors(tree, vert_node, chi_v=None, T_v=None):
